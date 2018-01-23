@@ -640,7 +640,7 @@ func TestPipesAreClear(t *testing.T) {
 
 	// read this body after 5s (after call times out)
 	bodOne := `{"echoContent":"yodawg"}`
-	delayBodyOne := &delayReader{inny: strings.NewReader(bodOne), delay: 5 * time.Second}
+	delayBodyOne := &delayReader{inny: strings.NewReader(bodOne), delay: 2 * time.Second}
 
 	req, err := http.NewRequest("GET", call.URL, ioutil.NopCloser(delayBodyOne))
 	if err != nil {
@@ -708,17 +708,17 @@ func TestPipesAreClear(t *testing.T) {
 	}
 	defer res.Body.Close()
 
-	// {"request":{},"header":{"Fn_call_id":["01C32SA8WX0000600000000000"]
+	// {"request":{"echoContent":"yodawg"}}
 	var resp struct {
-		H http.Header `json:"header"`
+		R struct {
+			Body string `json:"echoContent"`
+		} `json:"request"`
 	}
 
 	json.NewDecoder(res.Body).Decode(&resp)
 
-	rid := resp.H.Get("FN_CALL_ID")
-
-	if rid != callI.Model().ID {
-		t.Fatalf("body from second call was not what we wanted. boo. got wrong id: %v wanted: %v", rid, callI.Model().ID)
+	if resp.R.Body != "NODAWG" {
+		t.Fatalf("body from second call was not what we wanted. boo. got wrong body: %v wanted: %v", resp.R.Body, "NODAWG")
 	}
 
 	// TODO we need to make this test fail if 2 containers launch, too!
@@ -733,4 +733,116 @@ type delayReader struct {
 func (r *delayReader) Read(b []byte) (int, error) {
 	r.once.Do(func() { time.Sleep(r.delay) })
 	return r.inny.Read(b)
+}
+
+func TestPipesDontMakeSpuriousCalls(t *testing.T) {
+	// if we swap out the pipes between tasks really fast, we need to ensure that
+	// there are no spurious reads on the container's input that give us a bad
+	// task output (i.e. 2nd task should succeed). if this test is fussing up,
+	// make sure input swapping out is not racing, it is very likely not the test
+	// that is finicky since this is a totally normal happy path (run 2 hot tasks
+	// in the same container in a row).
+
+	call := testCall()
+	call.Type = "sync"
+	call.Format = "http"
+	call.IdleTimeout = 60 // keep this bad boy alive
+	call.Timeout = 4      // short
+
+	// we need to load in app & route so that FromRequest works
+	ds := datastore.NewMockInit(
+		[]*models.App{
+			{Name: call.AppName},
+		},
+		[]*models.Route{
+			{
+				Path:        call.Path,
+				AppName:     call.AppName,
+				Image:       call.Image,
+				Type:        call.Type,
+				Format:      call.Format,
+				Timeout:     call.Timeout,
+				IdleTimeout: call.IdleTimeout,
+				Memory:      call.Memory,
+			},
+		}, nil,
+	)
+
+	a := New(NewDirectDataAccess(ds, ds, new(mqs.Mock)))
+	defer a.Close()
+
+	bodOne := `{"echoContent":"yodawg"}`
+	req, err := http.NewRequest("GET", call.URL, strings.NewReader(bodOne))
+	if err != nil {
+		t.Fatal("unexpected error building request", err)
+	}
+
+	var outOne bytes.Buffer
+	callI, err := a.GetCall(FromRequest(call.AppName, call.Path, req), WithWriter(&outOne))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// this will time out after 4s, our reader reads after 5s
+	t.Log("before submit one:", time.Now())
+	err = a.Submit(callI)
+	t.Log("after submit one:", time.Now())
+	if err != nil {
+		t.Error("got error from submit when task should succeed", err)
+	}
+
+	io.WriteString(os.Stdout, "\nWRITER GOT:\n")
+	io.WriteString(os.Stdout, outOne.String())
+	io.WriteString(os.Stdout, "\nNEWLINE\n")
+
+	// if we submit the same call to the hot container again,
+	// this can be finicky if the
+	// hot logic simply fails to re-use a container then this will
+	// 'just work' but at one point this failed.
+
+	bodTwo := `{"echoContent":"NODAWG"}`
+	req, err = http.NewRequest("GET", call.URL, strings.NewReader(bodTwo))
+	if err != nil {
+		t.Fatal("unexpected error building request", err)
+	}
+
+	var outTwo bytes.Buffer
+	callI, err = a.GetCall(FromRequest(call.AppName, call.Path, req), WithWriter(&outTwo))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Log("before submit two:", time.Now())
+	err = a.Submit(callI)
+	t.Log("after submit two:", time.Now())
+	if err != nil {
+		// don't do a Fatal so that we can read the body to see what really happened
+		t.Error("got error from submit when task should succeed", err)
+	}
+
+	io.WriteString(os.Stdout, "\nWRITER GOT:\n")
+	io.WriteString(os.Stdout, outTwo.String())
+	io.WriteString(os.Stdout, "\nNEWLINE\n")
+
+	// we're using http format so this will have written a whole http request
+	res, err := http.ReadResponse(bufio.NewReader(&outTwo), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+
+	// {"request":{"echoContent":"yodawg"}}
+	var resp struct {
+		R struct {
+			Body string `json:"echoContent"`
+		} `json:"request"`
+	}
+
+	json.NewDecoder(res.Body).Decode(&resp)
+
+	if resp.R.Body != "NODAWG" {
+		t.Fatalf("body from second call was not what we wanted. boo. got wrong body: %v wanted: %v", resp.R.Body, "NODAWG")
+	}
+
+	// TODO we need to make this test fail if 2 containers launch, too!
 }

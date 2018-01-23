@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -795,6 +794,7 @@ type ghostWriter struct {
 
 func (g *ghostWriter) swap(w io.Writer) (old io.Writer) {
 	g.Lock()
+	logrus.Debugf("SWAP WRITER %p %T %p \n", g, w, w)
 	old = g.inner
 	g.inner = w
 	g.Unlock()
@@ -806,7 +806,17 @@ func (g *ghostWriter) Write(b []byte) (int, error) {
 	g.Lock()
 	w := g.inner
 	g.Unlock()
-	return w.Write(b)
+	logrus.Debugf("PRE WRITE THE BYTES %T %p %v\n", w, w, len(b))
+	n, err := w.Write(b)
+	logrus.Debugf("WRITE THE BYTES %T %p %v %v\n", w, w, n, err)
+	if err == io.ErrClosedPipe {
+		g.Lock()
+		logrus.Debugf("THIS IS THE READER YOU WERE LOOKING FOR %T %p\n", g.inner, g.inner)
+		g.Unlock()
+		// TODO do we needa wait here?
+		err = nil
+	}
+	return n, err
 }
 
 // ghostReader is an io.ReadCloser who will pass reads to an inner reader
@@ -821,7 +831,7 @@ type ghostReader struct {
 
 func (g *ghostReader) swap(r io.Reader) {
 	g.cond.L.Lock()
-	fmt.Printf("SWAP READER %p %T %p \n", g, r, r)
+	logrus.Debugf("SWAP READER %p %T %p \n", g, r, r)
 	g.inner = r
 	g.cond.L.Unlock()
 	g.cond.Broadcast()
@@ -834,14 +844,14 @@ func (g *ghostReader) Close() {
 	g.cond.Broadcast()
 }
 
-func (g *ghostReader) Read(b []byte) (int, error) {
+func (g *ghostReader) awaitRealReader() io.Reader {
 	// wait for a real reader
 	g.cond.L.Lock()
-	fmt.Printf("READ READER %p %T %p \n", g, g.inner, g.inner)
+	logrus.Debugf("READ READER %p %T %p \n", g, g.inner, g.inner)
 	for {
 		if g.closed { // check this first
 			g.cond.L.Unlock()
-			return 0, io.EOF
+			return eofReader{}
 		}
 		if _, ok := g.inner.(*waitReader); ok {
 			g.cond.Wait()
@@ -853,8 +863,31 @@ func (g *ghostReader) Read(b []byte) (int, error) {
 	// we don't need to serialize reads but swapping g.inner could be a race if unprotected
 	r := g.inner
 	g.cond.L.Unlock()
-	fmt.Printf("READ THE BYTES %T %p : %s\n", r, r, string(b))
-	return r.Read(b)
+	return r
+}
+
+type eofReader struct{}
+
+func (e eofReader) Read([]byte) (int, error) { return 0, io.EOF }
+
+func (g *ghostReader) Read(b []byte) (int, error) {
+	r := g.awaitRealReader()
+
+	logrus.Debugf("PRE READ THE BYTES %T %p %v \n", r, r, len(b))
+	n, err := r.Read(b)
+	// TODO filter error here? we don't really want any error from writing/reading pipes
+	// to shut down our streams into the container (generally). need to figure out if the
+	// container pipe is actually borked to die.
+	// logrus.Debugf("READ THE BYTES %T %p %v %v : %s\n", r, r, n, err, string(b))
+	logrus.Debugf("READ THE BYTES %T %p %v %v\n", r, r, n, err)
+	if err == io.ErrClosedPipe {
+		g.cond.L.Lock()
+		logrus.Debugf("THIS IS THE READER YOU WERE LOOKING FOR %T %p\n", g.inner, g.inner)
+		g.cond.L.Unlock()
+		// TODO do we needa wait here?
+		err = nil
+	}
+	return n, err
 }
 
 // waitReader returns io.EOF if anyone calls Read. don't call Read, this is a sentinel type
